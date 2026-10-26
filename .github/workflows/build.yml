@@ -1,0 +1,123 @@
+name: Build upstream release
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream release tag (empty = latest stable release)'
+        type: string
+        default: ''
+      rebuild:
+        description: Rebuild an already published version
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 3 * * *'
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: upstream-release
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      UPSTREAM_REPO: wg-easy/wg-easy
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out packaging scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve upstream release
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          REBUILD: ${{ inputs.rebuild }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)"
+          fi
+          [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo 'Unsupported tag format'; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          build=true
+          # Check asset names, not just the existence of a release.
+          assets="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          if [ "$REBUILD" != true ] && jq -e --arg tag "$tag" '
+            any(.[]; .tag_name == $tag and
+              any(.assets[]; .name == "wg-easy-output.tar.gz") and
+              any(.assets[]; .name == "SHA256SUMS.txt") and
+              any(.assets[]; .name == "build-info.json"))' <<< "$assets" > /dev/null; then
+            build=false
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Upstream: $UPSTREAM_REPO@$tag; build: $build" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check out unmodified upstream source
+        if: steps.release.outputs.build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: wg-easy/wg-easy
+          ref: ${{ steps.release.outputs.tag }}
+          path: upstream
+          persist-credentials: false
+      - name: Build Linux x86_64 musl package
+        if: steps.release.outputs.build == 'true'
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -e CI=true -e COREPACK_ENABLE_AUTO_PIN=0 \
+            -e NEXT_TELEMETRY_DISABLED=1 -e NUXT_TELEMETRY_DISABLED=1 \
+            -e NEXT_PUBLIC_VERSION="${{ steps.release.outputs.tag }}" \
+            -e NEXT_PUBLIC_REVISION="$(git -C upstream rev-parse HEAD)" \
+            -e NEXT_PUBLIC_BUILDTIME="$(date -u +%FT%TZ)" \
+            -v "$PWD/upstream:/upstream" \
+            -v "$PWD/scripts:/scripts:ro" \
+            -v "$PWD/dist:/dist" \
+            node:24-alpine sh /scripts/build.sh
+      - name: Verify upstream files are unchanged
+        if: steps.release.outputs.build == 'true'
+        run: |
+          git -C upstream diff --exit-code HEAD
+          test -z "$(git -C upstream ls-files --others --exclude-standard)"
+      - name: Record build provenance and checksums
+        if: steps.release.outputs.build == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          jq -n \
+            --arg upstream "$UPSTREAM_REPO" \
+            --arg tag "$UPSTREAM_TAG" \
+            --arg commit "$(git -C upstream rev-parse HEAD)" \
+            --arg wrapper "$GITHUB_SHA" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{upstream: $upstream, tag: $tag, upstream_commit: $commit, packaging_commit: $wrapper, platform: "linux-x86_64-musl", node: "24", source_modified: false, build_run: $run}' > dist/build-info.json
+          cd dist
+          sha256sum wg-easy-output.tar.gz build-info.json > SHA256SUMS.txt
+      - name: Upload build artifacts
+        if: steps.release.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wg-easy-${{ steps.release.outputs.tag }}-linux-x86_64-musl
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish upstream version
+        if: steps.release.outputs.build == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          printf 'Upstream: https://github.com/%s/tree/%s\n\nSource commit: `%s`\n\nLinux x86_64, musl (Alpine), Node.js 24.\nBuilt without modifying upstream tracked files. See build-info.json and SHA256SUMS.txt.\n' \
+            "$UPSTREAM_REPO" "$UPSTREAM_TAG" "$(git -C upstream rev-parse HEAD)" > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$UPSTREAM_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$UPSTREAM_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$UPSTREAM_TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "wg-easy $UPSTREAM_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" --latest
+          fi
