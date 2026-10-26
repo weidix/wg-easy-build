@@ -77,7 +77,7 @@ jobs:
             -e NEXT_PUBLIC_VERSION="${{ steps.release.outputs.tag }}" \
             -e NEXT_PUBLIC_REVISION="$(git -C upstream rev-parse HEAD)" \
             -e NEXT_PUBLIC_BUILDTIME="$(date -u +%FT%TZ)" \
-            -v "$PWD/upstream:/upstream" \
+            -v "$PWD/upstream:/upstream:ro" \
             -v "$PWD/scripts:/scripts:ro" \
             -v "$PWD/dist:/dist" \
             node:24-alpine sh /scripts/build.sh
